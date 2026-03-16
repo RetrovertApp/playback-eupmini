@@ -6,5 +6,5 @@
  #include <sys/types.h>
 +#include <cstdint>
  #include <iostream>
-
+ 
  class PolyphonicAudioDevice {
