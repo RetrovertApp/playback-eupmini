@@ -1,0 +1,73 @@
+diff --git a/eupplayer_townsEmulator.hpp b/eupplayer_townsEmulator.hpp
+index 39fef23..2b75a55 100644
+--- a/eupplayer_townsEmulator.hpp
++++ b/eupplayer_townsEmulator.hpp
+@@ -53,6 +53,9 @@ struct pcm_struct {
+ };
+ extern struct pcm_struct pcm;
+ 
++typedef void (*EUP_TownsEmulator_OutputCallback)(
++    void *userData, int16_t const *samples, size_t frameCount);
++
+ class TownsPcmInstrument;
+ class TownsPcmSound;
+ class TownsPcmEnvelope;
+@@ -199,5 +202,7 @@ class EUP_TownsEmulator : public TownsAudioDevice {
+ 
+ class EUP_TownsEmulator : public TownsAudioDevice {
++    EUP_TownsEmulator_OutputCallback _outputCallback = nullptr;
++    void *_outputCallbackUserData = nullptr;
+     FILE *_ostr = nullptr;
+     enum { _maxChannelNum = 16,
+            _maxFmInstrumentNum = 128,
+@@ -252,5 +257,7 @@ public:
+     void setFmInstrumentParameter(int num, uint8_t const *instrument);
+     void setPcmInstrumentParameters(uint8_t const *instrument, size_t size);
++    void outputCallback(EUP_TownsEmulator_OutputCallback callback,
++                        void *userData);
+     void outputStream(FILE* ostr);
+     FILE* outputStream_get();
+     void nextTick();
+diff --git a/eupplayer_townsEmulator.cpp b/eupplayer_townsEmulator.cpp
+index b832f6e..fbbcb66 100644
+--- a/eupplayer_townsEmulator.cpp
++++ b/eupplayer_townsEmulator.cpp
+@@ -1329,6 +1329,13 @@ void EUP_TownsEmulator::setPcmInstrumentParameters(uint8_t const *instrument, si
+     }
+ }
+ 
++void EUP_TownsEmulator::outputCallback(
++    EUP_TownsEmulator_OutputCallback callback, void *userData)
++{
++    _outputCallback = callback;
++    _outputCallbackUserData = userData;
++}
++
+ void EUP_TownsEmulator::outputStream(FILE* ostr)
+ {
+     _ostr = ostr;
+@@ -1520,7 +1527,8 @@ void EUP_TownsEmulator::nextTick()
+         }
+     }
+     else /*(2 == _outputSampleSize)*/ {
+-        if ( (nullptr != this->outputStream_get()) && (true == this->output2File_read()) ) {
++        if (_outputCallback != nullptr ||
++            ((nullptr != this->outputStream_get()) && (true == this->output2File_read()))) {
+ #if defined ( _MSC_VER )
+             int16_t *buf1 = new int16_t[buflen * _outputSampleChannels];
+             if (nullptr == buf1) {
+@@ -1549,7 +1557,13 @@ void EUP_TownsEmulator::nextTick()
+                 buf1[i] = (32767 < d) ? 32767 : ((-32768 > d) ? -32768 : d);
+             }
+ 
+-            fwrite(buf1, sizeof(buf1[0]), buflen * _outputSampleChannels, _ostr);
++            if (_outputCallback != nullptr) {
++                _outputCallback(_outputCallbackUserData, buf1,
++                                static_cast<size_t>(buflen));
++            }
++            else {
++                fwrite(buf1, sizeof(buf1[0]), buflen * _outputSampleChannels, _ostr);
++            }
+ 
+             pcm.count += static_cast<int>(buflen);
+ 

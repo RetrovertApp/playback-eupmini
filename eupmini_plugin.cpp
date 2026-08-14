@@ -5,9 +5,8 @@
 // Uses the eupmini library for FM TOWNS sound emulation (6 FM + 8 PCM channels).
 // The library uses global state (pcm struct), so only one file at a time.
 //
-// Audio output uses the library's output2File mode which writes S16 stereo samples
-// to a FILE* stream, bypassing the ring buffer path that requires a concurrent
-// SDL audio consumer.
+// Audio output uses an in-memory callback, bypassing eupmini's FILE* and SDL
+// ring-buffer paths.
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 extern "C" {
@@ -21,9 +20,10 @@ extern "C" {
 #include "eupplayer.hpp"
 #include "eupplayer_townsEmulator.hpp"
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
+#include <vector>
 
 #ifdef _WIN32
 #define strcasecmp _stricmp
@@ -55,10 +55,15 @@ struct EupminiReplayerData {
     int file_open;
     int elapsed_frames;
     int max_frames;
-    // Temporary file for output2File mode (cross-platform, replaces POSIX open_memstream)
-    FILE* mem_stream;
-    long mem_read_pos;
+    std::vector<int16_t> pending_samples;
 };
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void eupmini_collect_pcm(void* user_data, int16_t const* samples, size_t frame_count) {
+    auto* data = static_cast<EupminiReplayerData*>(user_data);
+    data->pending_samples.insert(data->pending_samples.end(), samples, samples + frame_count * 2);
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -69,12 +74,8 @@ static const char* eupmini_plugin_supported_extensions(void) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void* eupmini_plugin_create(const RVService* service_api) {
-    auto* data = (EupminiReplayerData*)calloc(1, sizeof(EupminiReplayerData));
-    if (data == nullptr) {
-        return nullptr;
-    }
-
-    return data;
+    (void)service_api;
+    return new (std::nothrow) EupminiReplayerData{};
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -87,11 +88,8 @@ static int eupmini_plugin_destroy(void* user_data) {
         delete data->player;
     }
     delete data->device;
-    if (data->mem_stream) {
-        fclose(data->mem_stream);
-    }
     free(data->file_data);
-    free(data);
+    delete data;
     return 0;
 }
 
@@ -113,11 +111,7 @@ static int eupmini_plugin_open(void* user_data, const char* url, uint32_t subson
     data->device = nullptr;
     free(data->file_data);
     data->file_data = nullptr;
-    if (data->mem_stream) {
-        fclose(data->mem_stream);
-        data->mem_stream = nullptr;
-    }
-    data->mem_read_pos = 0;
+    data->pending_samples.clear();
     data->file_open = 0;
 
     RVIoReadUrlResult read_res = rv_io_read_url_to_memory(url);
@@ -156,22 +150,7 @@ static int eupmini_plugin_open(void* user_data, const char* url, uint32_t subson
     data->device->outputSampleChannels(2);
     data->device->rate(EUP_SAMPLE_RATE);
 
-    // Use output2File mode: writes S16 samples to a FILE* stream,
-    // bypassing the ring buffer path that deadlocks without SDL audio thread.
-    // Uses tmpfile() for cross-platform compatibility (open_memstream is POSIX-only).
-    data->mem_stream = tmpfile();
-    if (data->mem_stream == nullptr) {
-        rv_error("eupmini: Failed to create memory stream");
-        delete data->player;
-        data->player = nullptr;
-        delete data->device;
-        data->device = nullptr;
-        free(data->file_data);
-        data->file_data = nullptr;
-        return -1;
-    }
-    data->device->output2File(true);
-    data->device->outputStream(data->mem_stream);
+    data->device->outputCallback(eupmini_collect_pcm, data);
 
     data->player->outputDevice(data->device);
 
@@ -199,7 +178,7 @@ static int eupmini_plugin_open(void* user_data, const char* url, uint32_t subson
     int tempo = buf[0x805] + 30;
     data->player->tempo(tempo);
 
-    // Initialize the pcm struct (count is used by output2File mode)
+    // Initialize eupmini's required global PCM state.
     memset(&pcm, 0, sizeof(pcm));
 
     // Start playback (skip 2048-byte header + 6-byte prefix)
@@ -208,7 +187,6 @@ static int eupmini_plugin_open(void* user_data, const char* url, uint32_t subson
     data->file_open = 1;
     data->elapsed_frames = 0;
     data->max_frames = (int)(((int64_t)DEFAULT_LENGTH_MS * EUP_SAMPLE_RATE) / 1000);
-    data->mem_read_pos = 0;
 
     return 0;
 }
@@ -227,11 +205,7 @@ static void eupmini_plugin_close(void* user_data) {
     data->device = nullptr;
     free(data->file_data);
     data->file_data = nullptr;
-    if (data->mem_stream) {
-        fclose(data->mem_stream);
-        data->mem_stream = nullptr;
-    }
-    data->mem_read_pos = 0;
+    data->pending_samples.clear();
     data->file_open = 0;
 }
 
@@ -267,48 +241,42 @@ static RVReadInfo eupmini_plugin_read_data(void* user_data, RVReadData dest) {
         return (RVReadInfo) { format, 0, RVReadStatus_Error};
     }
 
-    if (!data->player->isPlaying() || data->elapsed_frames >= data->max_frames) {
+    if (data->elapsed_frames >= data->max_frames ||
+        (!data->player->isPlaying() && data->pending_samples.empty())) {
         return (RVReadInfo) { format, 0, RVReadStatus_Finished};
     }
 
     uint32_t max_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    int remaining_frames = data->max_frames - data->elapsed_frames;
+    if (max_frames > (uint32_t)remaining_frames) {
+        max_frames = (uint32_t)remaining_frames;
+    }
 
-    // Generate audio by calling nextTick until we have enough samples
-    while (data->player->isPlaying()) {
-        fflush(data->mem_stream);
-        long write_pos = ftell(data->mem_stream);
-        size_t available_bytes = (size_t)(write_pos - data->mem_read_pos);
-        size_t available_frames = available_bytes / (sizeof(int16_t) * 2);
-        if (available_frames >= max_frames) {
-            break;
-        }
+    // Generate audio by calling nextTick until the callback has enough samples.
+    while (data->player->isPlaying() && data->pending_samples.size() / 2 < max_frames) {
         data->player->nextTick();
     }
 
-    fflush(data->mem_stream);
-
-    // Read S16 samples from temp file
-    long write_pos = ftell(data->mem_stream);
-    size_t available_bytes = (size_t)(write_pos - data->mem_read_pos);
-    size_t available_frames = available_bytes / (sizeof(int16_t) * 2);
+    size_t available_frames = data->pending_samples.size() / 2;
     if (available_frames > max_frames) {
         available_frames = max_frames;
     }
 
-    // Seek to read position, read S16 data directly to output, then seek back to end for writes
-    fseek(data->mem_stream, data->mem_read_pos, SEEK_SET);
-    size_t read_count = fread(dest.channels_output, sizeof(int16_t) * 2, available_frames, data->mem_stream);
-    fseek(data->mem_stream, 0, SEEK_END);
-
-    data->mem_read_pos += (long)(read_count * sizeof(int16_t) * 2);
-    data->elapsed_frames += (int)read_count;
+    size_t sample_count = available_frames * 2;
+    if (sample_count > 0) {
+        memcpy(dest.channels_output, data->pending_samples.data(), sample_count * sizeof(int16_t));
+        data->pending_samples.erase(data->pending_samples.begin(),
+                                    data->pending_samples.begin() + sample_count);
+    }
+    data->elapsed_frames += (int)available_frames;
 
     RVReadStatus status = RVReadStatus_Ok;
-    if (!data->player->isPlaying() || data->elapsed_frames >= data->max_frames) {
+    if (data->elapsed_frames >= data->max_frames ||
+        (!data->player->isPlaying() && data->pending_samples.empty())) {
         status = RVReadStatus_Finished;
     }
 
-    return (RVReadInfo) { format, (uint32_t)read_count, status};
+    return (RVReadInfo) { format, (uint32_t)available_frames, status};
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

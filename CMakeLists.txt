@@ -7,6 +7,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(playback_eupmini C CXX)
 
+include(CTest)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PlaybackPlugin)
 
@@ -17,7 +19,9 @@ download_library(
     FILENAME "eupmini-3640a82.tar.gz"
     HASH "3035d096333de832ecf23c35a0f1519530e3b6215f1482df4c10b1d92b156cbd"
     EXTRACT_DIR "eupmini-3640a82f343360bac08041ae82d2938efe444f17"
-    PATCHES patches/cstdint-fix.patch
+    PATCHES
+        patches/cstdint-fix.patch
+        patches/pcm-output-callback.patch
 )
 
 # Core library sources (excluding eupplay.cpp CLI main)
@@ -73,3 +77,15 @@ set_target_properties(eupmini_playback PROPERTIES
 )
 
 rv_set_plugin_properties(eupmini_playback)
+
+if(BUILD_TESTING)
+    add_executable(eupmini_pcm_output_test
+        tests/eupmini_pcm_output_test.cpp
+    )
+    target_link_libraries(eupmini_pcm_output_test PRIVATE eupmini_static)
+    set_target_properties(eupmini_pcm_output_test PROPERTIES
+        CXX_STANDARD 11
+        CXX_STANDARD_REQUIRED ON
+    )
+    add_test(NAME eupmini_pcm_output COMMAND eupmini_pcm_output_test)
+endif()
