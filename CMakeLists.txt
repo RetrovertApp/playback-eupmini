@@ -68,7 +68,7 @@ target_compile_definitions(eupmini_playback PRIVATE
 
 target_link_libraries(eupmini_playback PRIVATE eupmini_static)
 if(UNIX)
-    target_link_libraries(eupmini_playback PRIVATE stdc++ m)
+    target_link_libraries(eupmini_playback PRIVATE m)
 endif()
 
 set_target_properties(eupmini_playback PROPERTIES
