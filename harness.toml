@@ -1,0 +1,9 @@
+[plugin]
+name = "eupmini"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/WANDER.EUP"
+sha256 = "0d1af477248c4b9edd21bc3c579a08c5486e2ce978134dbf35e706261694b362"

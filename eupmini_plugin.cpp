@@ -246,7 +246,8 @@ static RVReadInfo eupmini_plugin_read_data(void* user_data, RVReadData dest) {
         return (RVReadInfo) { format, 0, RVReadStatus_Finished};
     }
 
-    uint32_t max_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    uint32_t capacity_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    uint32_t max_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
     int remaining_frames = data->max_frames - data->elapsed_frames;
     if (max_frames > (uint32_t)remaining_frames) {
         max_frames = (uint32_t)remaining_frames;
