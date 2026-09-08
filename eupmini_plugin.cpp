@@ -23,6 +23,8 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <algorithm>
+#include <cstdio>
 #include <vector>
 
 #ifdef _WIN32
@@ -41,6 +43,15 @@ struct pcm_struct pcm;
 // Default song length: 5 minutes (Euphony files don't embed duration)
 #define DEFAULT_LENGTH_MS (5 * 60 * 1000)
 
+// The emulator has 16 channels; a EUP header assigns at most 6 FM and 8 PCM
+// devices among them, and only the assigned ones are worth showing.
+#define EUP_EMULATOR_CHANNELS 16
+#define EUP_MAX_SCOPE_CHANNELS 14
+// Per-channel scope history, as a ring. Power of two: the index wraps with a mask.
+#define EUP_SCOPE_WINDOW 2048
+// Window the VU peak is taken over.
+#define EUP_VU_WINDOW 512
+
 RV_PLUGIN_USE_IO_API();
 RV_PLUGIN_USE_METADATA_API();
 extern "C" { RV_PLUGIN_USE_LOG_API(); }
@@ -56,6 +67,16 @@ struct EupminiReplayerData {
     int elapsed_frames;
     int max_frames;
     std::vector<int16_t> pending_samples;
+
+    // Visualization. scope_slot maps an emulator channel to its scope index, or
+    // -1 for a channel the header assigned no device to.
+    int scope_slot[EUP_EMULATOR_CHANNELS];
+    char scope_names[EUP_MAX_SCOPE_CHANNELS][24];
+    uint32_t scope_count;
+    bool scope_enabled;
+    std::vector<float> scope_ring;  // scope_count * EUP_SCOPE_WINDOW
+    uint32_t scope_pos;
+    uint32_t scope_tick_frames;  // frames the current tick reported, advanced by read_data
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -63,6 +84,53 @@ struct EupminiReplayerData {
 static void eupmini_collect_pcm(void* user_data, int16_t const* samples, size_t frame_count) {
     auto* data = static_cast<EupminiReplayerData*>(user_data);
     data->pending_samples.insert(data->pending_samples.end(), samples, samples + frame_count * 2);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Give one emulator channel a scope slot. The header can name the same channel
+// twice, or a channel outside the emulator's range, so both are rejected.
+
+static void eupmini_map_scope_channel(EupminiReplayerData* data, int channel, const char* kind, int index) {
+    if (channel < 0 || channel >= EUP_EMULATOR_CHANNELS) {
+        return;
+    }
+    if (data->scope_slot[channel] >= 0 || data->scope_count >= EUP_MAX_SCOPE_CHANNELS) {
+        return;
+    }
+
+    int slot = (int)data->scope_count++;
+    data->scope_slot[channel] = slot;
+    snprintf(data->scope_names[slot], sizeof(data->scope_names[slot]), "%s %d", kind, index);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Called by the patched emulator once per channel per tick, before the channels
+// are summed. The samples are already scaled the way the mix scales them.
+//
+// This runs while nextTick() is generating, which is ahead of the audio the host
+// has actually been handed by whatever is still queued in pending_samples -- at
+// most one tick, so the scope leads the output very slightly.
+
+static void eupmini_collect_scope(void* user_data, int channel, int16_t const* samples, size_t frame_count) {
+    auto* data = static_cast<EupminiReplayerData*>(user_data);
+    if (!data->scope_enabled || channel < 0 || channel >= EUP_EMULATOR_CHANNELS) {
+        return;
+    }
+
+    int slot = data->scope_slot[channel];
+    if (slot < 0) {
+        return;
+    }
+
+    // Every channel of a tick writes the same span, so the position stays put
+    // here and read_data advances it once the whole tick has been reported.
+    data->scope_tick_frames = (uint32_t)frame_count;
+    uint32_t pos = data->scope_pos;
+    float* ring = &data->scope_ring[(size_t)slot * EUP_SCOPE_WINDOW];
+    for (size_t frame = 0; frame < frame_count; frame++) {
+        // Left of the interleaved stereo pair is enough for a scope trace.
+        ring[(pos + frame) & (EUP_SCOPE_WINDOW - 1)] = (float)samples[frame * 2] * (1.0f / 32768.0f);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -159,14 +227,56 @@ static int eupmini_plugin_open(void* user_data, const char* url, uint32_t subson
         data->player->mapTrack_toChannel(trk, buf[0x394 + trk]);
     }
 
+    for (int i = 0; i < EUP_EMULATOR_CHANNELS; i++) {
+        data->scope_slot[i] = -1;
+    }
+    data->scope_count = 0;
+    data->scope_pos = 0;
+    data->scope_tick_frames = 0;
+
+    // Seed every FM program with the default instrument, exactly as eupmini's
+    // own player does before it looks for a .fmb bank. Without it every
+    // operator keeps attack rate 0, which the emulator correctly reads as an
+    // envelope that never rises -- the whole song decodes to silence. That was
+    // hidden until now by an integer overflow in the attack-time division,
+    // which wrapped to a negative divisor and read outside the attack table;
+    // see patches/attack-time-overflow.patch.
+    {
+        static const uint8_t default_fm_instrument[] = {
+            ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',  // name
+            17,  33,  10,  17,                       // detune / multiple
+            25,  10,  57,  0,                        // output level
+            154, 152, 218, 216,                      // key scale / attack rate
+            15,  12,  7,   12,                       // amon / decay rate
+            0,   5,   3,   5,                        // sustain rate
+            38,  40,  70,  40,                       // sustain level / release rate
+            20,                                      // feedback / algorithm
+            0xc0,                                    // pan, LFO
+            0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+        };
+        for (int n = 0; n < 128; n++) {
+            data->device->setFmInstrumentParameter(n, default_fm_instrument);
+        }
+    }
+
     // Assign FM devices to channels (6 FM channels)
     for (int i = 0; i < 6; i++) {
         data->device->assignFmDeviceToChannel(buf[0x6D4 + i]);
+        eupmini_map_scope_channel(data, buf[0x6D4 + i], "FM", i + 1);
     }
 
     // Assign PCM devices to channels (8 PCM channels)
     for (int i = 0; i < 8; i++) {
         data->device->assignPcmDeviceToChannel(buf[0x6DA + i]);
+        eupmini_map_scope_channel(data, buf[0x6DA + i], "PCM", i + 1);
+    }
+
+    data->scope_ring.assign((size_t)data->scope_count * EUP_SCOPE_WINDOW, 0.0f);
+    // The callback is installed only while the scope is on: with it set, the
+    // emulator renders every channel into its own buffer instead of straight
+    // into the mix, which is not worth paying for when nothing is drawing it.
+    if (data->scope_enabled && data->scope_count != 0) {
+        data->device->scopeCallback(eupmini_collect_scope, data);
     }
 
     // Note: FM/PCM instrument banks (.fmb/.pmb) are not loaded here since
@@ -255,7 +365,11 @@ static RVReadInfo eupmini_plugin_read_data(void* user_data, RVReadData dest) {
 
     // Generate audio by calling nextTick until the callback has enough samples.
     while (data->player->isPlaying() && data->pending_samples.size() / 2 < max_frames) {
+        data->scope_tick_frames = 0;
         data->player->nextTick();
+        if (data->scope_enabled && data->scope_tick_frames != 0) {
+            data->scope_pos = (data->scope_pos + data->scope_tick_frames) & (EUP_SCOPE_WINDOW - 1);
+        }
     }
 
     size_t available_frames = data->pending_samples.size() / 2;
@@ -340,6 +454,115 @@ static void eupmini_plugin_static_init(const RVService* service_api) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Visualization.
+//
+// The scope is each emulator channel's own contribution, taken before the mix
+// sums them, so it needs no analysis of the output. Only the channels the EUP
+// header assigned an FM or PCM device to are offered.
+
+static bool eupmini_plugin_get_structure(void* user_data, RVVizInfo* out) {
+    auto* data = (EupminiReplayerData*)user_data;
+    if (data == nullptr || out == nullptr || data->scope_count == 0) {
+        return false;
+    }
+
+    out->caps = RVVizCaps_Scope | RVVizCaps_Vu;
+    out->scroll_mode = RVScrollMode_Synchronized;
+    out->pattern_channel_count = 0;
+    out->scope_channel_count = data->scope_count;
+    out->column_count = 0;
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t eupmini_plugin_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    auto* data = (EupminiReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    uint32_t count = data->scope_count < cap ? data->scope_count : cap;
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "%s", data->scope_names[i]);
+        out[i].scope_width = 1;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void eupmini_plugin_set_scope_enabled(void* user_data, bool on) {
+    auto* data = (EupminiReplayerData*)user_data;
+    if (data == nullptr) {
+        return;
+    }
+
+    if (on && !data->scope_enabled) {
+        std::fill(data->scope_ring.begin(), data->scope_ring.end(), 0.0f);
+    }
+    data->scope_enabled = on;
+
+    if (data->device != nullptr) {
+        data->device->scopeCallback(on && data->scope_count != 0 ? eupmini_collect_scope : nullptr, data);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t eupmini_plugin_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
+    auto* data = (EupminiReplayerData*)user_data;
+    if (data == nullptr || out == nullptr || !data->scope_enabled) {
+        return 0;
+    }
+    if (channel < 0 || (uint32_t)channel >= data->scope_count) {
+        return 0;
+    }
+
+    uint32_t count = cap < EUP_SCOPE_WINDOW ? cap : EUP_SCOPE_WINDOW;
+    const float* ring = &data->scope_ring[(size_t)channel * EUP_SCOPE_WINDOW];
+    uint32_t start = (data->scope_pos + EUP_SCOPE_WINDOW - count) & (EUP_SCOPE_WINDOW - 1);
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = ring[(start + i) & (EUP_SCOPE_WINDOW - 1)];
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t eupmini_plugin_get_vu(void* user_data, float* out, uint32_t cap) {
+    auto* data = (EupminiReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    // The host checks this against the declared channel count on every captured
+    // frame, so the count is reported even with the capture switched off.
+    uint32_t count = data->scope_count < cap ? data->scope_count : cap;
+    for (uint32_t c = 0; c < count; c++) {
+        if (!data->scope_enabled) {
+            out[c] = 0.0f;
+            continue;
+        }
+        const float* ring = &data->scope_ring[(size_t)c * EUP_SCOPE_WINDOW];
+        uint32_t start = (data->scope_pos + EUP_SCOPE_WINDOW - EUP_VU_WINDOW) & (EUP_SCOPE_WINDOW - 1);
+        float peak = 0.0f;
+        for (uint32_t i = 0; i < EUP_VU_WINDOW; i++) {
+            float v = ring[(start + i) & (EUP_SCOPE_WINDOW - 1)];
+            if (v < 0.0f) {
+                v = -v;
+            }
+            if (v > peak) {
+                peak = v;
+            }
+        }
+        out[c] = peak;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static RVPlaybackPlugin g_eupmini_plugin = {
     RV_PLAYBACK_PLUGIN_API_VERSION,
@@ -360,17 +583,17 @@ static RVPlaybackPlugin g_eupmini_plugin = {
     nullptr, // settings_updated
     nullptr, // static_destroy
 
-    // Visualization: none (caps = 0; pure decoder, no pattern grid or scope).
-    nullptr, // get_structure
+    // Visualization: per-channel scope and VU taken before the mix sums them.
+    eupmini_plugin_get_structure,
     nullptr, // get_columns
     nullptr, // get_pattern_channels
-    nullptr, // get_scope_channels
+    eupmini_plugin_get_scope_channels,
     nullptr, // get_position
     nullptr, // get_channel_rows
     nullptr, // get_cells
-    nullptr, // set_scope_enabled
-    nullptr, // get_scope_samples
-    nullptr, // get_vu
+    eupmini_plugin_set_scope_enabled,
+    eupmini_plugin_get_scope_samples,
+    eupmini_plugin_get_vu,
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

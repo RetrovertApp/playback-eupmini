@@ -1,0 +1,20 @@
+diff --git a/eupplayer_townsEmulator.cpp b/eupplayer_townsEmulator.cpp
+index eee0762..9009b40 100644
+--- a/eupplayer_townsEmulator.cpp
++++ b/eupplayer_townsEmulator.cpp
+@@ -588,7 +588,14 @@ int TownsFmEmulator_Operator::nextTick(int rate, int phaseShift)
+             _state = _s_decaying;
+         }
+         else {
+-            int i = (static_cast<int64_t>(_tickCount) << (12+10)) / (static_cast<int64_t>(rate * _attackTime));
++            // rate * _attackTime was multiplied as int and only widened
++            // afterwards, so it overflowed to a negative divisor for slow
++            // attacks -- _attackTime counts 1<<12 per second, so anything past
++            // about 12s at 44.1kHz wraps. That made i negative and the
++            // attackOut[i] below read before the table, returning whatever the
++            // linker had placed there. Widen before the multiply, the way the
++            // numerator already is.
++            int i = (static_cast<int64_t>(_tickCount) << (12+10)) / (static_cast<int64_t>(rate) * _attackTime);
+             if (i >= 1024) {
+                 _currentLevel = 0LL;
+                 _state = _s_decaying;

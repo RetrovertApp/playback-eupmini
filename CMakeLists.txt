@@ -22,6 +22,8 @@ download_library(
     PATCHES
         patches/cstdint-fix.patch
         patches/pcm-output-callback.patch
+        patches/scope-capture.patch
+        patches/attack-time-overflow.patch
 )
 
 # Core library sources (excluding eupplay.cpp CLI main)

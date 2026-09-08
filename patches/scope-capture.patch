@@ -1,0 +1,85 @@
+diff --git a/eupplayer_townsEmulator.cpp b/eupplayer_townsEmulator.cpp
+index 2ac26c6..eee0762 100644
+--- a/eupplayer_townsEmulator.cpp
++++ b/eupplayer_townsEmulator.cpp
+@@ -1336,6 +1336,13 @@ void EUP_TownsEmulator::outputCallback(
+     _outputCallbackUserData = userData;
+ }
+ 
++void EUP_TownsEmulator::scopeCallback(
++    EUP_TownsEmulator_ScopeCallback callback, void *userData)
++{
++    _scopeCallback = callback;
++    _scopeCallbackUserData = userData;
++}
++
+ void EUP_TownsEmulator::outputStream(FILE* ostr)
+ {
+     _ostr = ostr;
+@@ -1386,7 +1393,31 @@ void EUP_TownsEmulator::nextTick()
+ 
+     for (int i = 0; i < _maxChannelNum; i++) {
+         if (_enabled[i]) {
+-            _channel[i]->nextTick(buf0, static_cast<int>(buflen));
++            if (nullptr == _scopeCallback) {
++                _channel[i]->nextTick(buf0, static_cast<int>(buflen));
++            }
++            else {
++                // Render the channel on its own so it can be reported, then add
++                // it to the mix. Integer addition, so the sum is unchanged.
++                int64_t const total = buflen * _outputSampleChannels;
++                int *chanbuf = new int[total];
++                int16_t *chanout = new int16_t[total];
++                memset(chanbuf, 0, sizeof(chanbuf[0]) * total);
++                _channel[i]->nextTick(chanbuf, static_cast<int>(buflen));
++                for (int64_t s = 0; s < total; s++) {
++                    int d = chanbuf[s];
++                    buf0[s] += d;
++                    // Same scaling the mix applies below, so the reported
++                    // samples line up with the audio.
++                    d *= this->volume();
++                    d >>= 10;
++                    chanout[s] = (32767 < d) ? 32767 : ((-32768 > d) ? -32768 : d);
++                }
++                _scopeCallback(_scopeCallbackUserData, i, chanout,
++                               static_cast<size_t>(buflen));
++                delete[] chanout;
++                delete[] chanbuf;
++            }
+         }
+     }
+ 
+diff --git a/eupplayer_townsEmulator.hpp b/eupplayer_townsEmulator.hpp
+index e6571e9..e072480 100644
+--- a/eupplayer_townsEmulator.hpp
++++ b/eupplayer_townsEmulator.hpp
+@@ -56,6 +56,11 @@ extern struct pcm_struct pcm;
+ typedef void (*EUP_TownsEmulator_OutputCallback)(
+     void *userData, int16_t const *samples, size_t frameCount);
+ 
++// Called once per channel per tick, before the channels are summed, with that
++// channel's own contribution scaled exactly the way the mix scales it.
++typedef void (*EUP_TownsEmulator_ScopeCallback)(
++    void *userData, int channel, int16_t const *samples, size_t frameCount);
++
+ class TownsPcmInstrument;
+ class TownsPcmSound;
+ class TownsPcmEnvelope;
+@@ -203,6 +208,8 @@ public:
+ class EUP_TownsEmulator : public TownsAudioDevice {
+     EUP_TownsEmulator_OutputCallback _outputCallback = nullptr;
+     void *_outputCallbackUserData = nullptr;
++    EUP_TownsEmulator_ScopeCallback _scopeCallback = nullptr;
++    void *_scopeCallbackUserData = nullptr;
+     FILE *_ostr = nullptr;
+     enum { _maxChannelNum = 16,
+            _maxFmInstrumentNum = 128,
+@@ -258,6 +265,8 @@ public:
+     void setPcmInstrumentParameters(uint8_t const *instrument, size_t size);
+     void outputCallback(EUP_TownsEmulator_OutputCallback callback,
+                         void *userData);
++    void scopeCallback(EUP_TownsEmulator_ScopeCallback callback,
++                       void *userData);
+     void outputStream(FILE* ostr);
+     FILE* outputStream_get();
+     void nextTick();
